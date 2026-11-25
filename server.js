@@ -1,5 +1,5 @@
-require('dotenv').config();
 const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const pool = require('./db');
 
@@ -66,6 +66,7 @@ app.get('/api/products', async (req, res) => {
     const [rows] = await pool.query(sql, params);
     res.json(rows);
   } catch (err) {
+    console.error('GET /api/products error:', err.message);
     res.status(500).json({ error: 'Gagal mengambil data produk.' });
   }
 });
