@@ -1,0 +1,6 @@
+# Template Fakta Hidup & Konteks Terkini
+# Salin menjadi data/facts.txt lalu isi dengan fakta nyata Anda (file facts.txt di-ignore oleh Git).
+
+- Nama panggilan: Nama Kamu
+- Domisili: Kota Kamu
+- Aktivitas utama: Kuliah / Kerja / Magang

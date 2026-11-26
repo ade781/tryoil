@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
@@ -13,12 +14,21 @@ const pino = require('pino');
 const { generateCloneReply } = require('./ai');
 
 const AUTH_DIR = path.join(__dirname, '..', 'auth_info');
+const CHAT_LOG_PATH = path.join(__dirname, '..', 'data', 'chat-log.jsonl');
 const DELAY_MIN_MS = Math.max(0, Number(process.env.REPLY_DELAY_MIN_MS) || 1500);
 const DELAY_MAX_MS = Math.max(DELAY_MIN_MS, Number(process.env.REPLY_DELAY_MAX_MS) || 3500);
 const IGNORE_GROUPS = process.env.IGNORE_GROUPS !== 'false';
+function normalizePhone(raw) {
+  const digits = String(raw || '').split('@')[0].replace(/\D/g, '');
+  if (digits.startsWith('08')) {
+    return '62' + digits.slice(1);
+  }
+  return digits;
+}
+
 const ALLOWED_NUMBERS = (process.env.ALLOWED_NUMBERS || '')
   .split(',')
-  .map((num) => num.replace(/\D/g, '').trim())
+  .map(normalizePhone)
   .filter(Boolean);
 
 let cloneEnabled = true;
@@ -28,6 +38,15 @@ let cloneEnabled = true;
  * @param {number} ms
  * @returns {Promise<void>}
  */
+function appendChatLog(entry) {
+  try {
+    fs.mkdirSync(path.dirname(CHAT_LOG_PATH), { recursive: true });
+    fs.appendFileSync(CHAT_LOG_PATH, JSON.stringify(entry) + '\n', 'utf8');
+  } catch (err) {
+    console.warn('[Bot] Gagal menulis log chat:', err.message);
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -67,7 +86,7 @@ function extractMessageText(msg) {
  * @returns {Promise<boolean>} true if command was handled
  */
 async function handleOwnerCommand(sock, jid, text) {
-  const cmd = text.toLowerCase();
+  const cmd = text.replace(/\s+/g, ' ').trim().toLowerCase();
   if (cmd === '!clone off') {
     cloneEnabled = false;
     await sock.sendMessage(jid, { text: '🔴 WA Clone dimatikan.' });
@@ -79,6 +98,12 @@ async function handleOwnerCommand(sock, jid, text) {
     return true;
   }
   if (cmd === '!clone status') {
+    const ownerNumber = normalizePhone(sock.user?.id || '');
+    const targetNumber = normalizePhone(jid);
+    if (ownerNumber && targetNumber !== ownerNumber) {
+      console.log(`[WA] Status diminta dari non-self chat (${jid}): active=${cloneEnabled}`);
+      return true;
+    }
     const allowedInfo = ALLOWED_NUMBERS.length ? ALLOWED_NUMBERS.join(', ') : 'Semua private chat';
     const statusText = [
       `🤖 *WA Clone Status*`,
@@ -117,7 +142,9 @@ async function startBot() {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log(`[WA] Koneksi terputus (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
       if (shouldReconnect) {
-        startBot();
+        setTimeout(() => {
+          startBot().catch((err) => console.error('[WA] Reconnect error:', err.message));
+        }, 3000);
       } else {
         console.log('[WA] Logged out. Hapus folder auth_info/ dan scan ulang QR untuk login.');
       }
@@ -148,22 +175,76 @@ async function startBot() {
         if (IGNORE_GROUPS && isGroup) continue;
 
         if (ALLOWED_NUMBERS.length > 0) {
-          const senderJid = msg.key.participant || jid;
-          const senderNumber = senderJid.split('@')[0].replace(/\D/g, '');
-          if (!ALLOWED_NUMBERS.includes(senderNumber)) continue;
+          const candidates = [
+            msg.key.participantAlt,
+            msg.key.remoteJidAlt,
+            msg.key.participant,
+            jid,
+          ];
+
+          if (jid.endsWith('@lid') && sock.signalRepository?.lidMapping?.getPNForLID) {
+            try {
+              const resolvedPn = await sock.signalRepository.lidMapping.getPNForLID(jid);
+              if (resolvedPn) candidates.push(resolvedPn);
+            } catch {
+              // ignore lid mapping lookup errors
+            }
+          }
+
+          const normalizedCandidates = candidates.map(normalizePhone).filter(Boolean);
+          const isAllowed = normalizedCandidates.some((num) => ALLOWED_NUMBERS.includes(num));
+          if (!isAllowed) {
+            console.log(
+              `[WA Skip] Tidak masuk whitelist -> jid=${jid} alt=${msg.key.remoteJidAlt || '-'} pushName="${msg.pushName || '-'}"`
+            );
+            continue;
+          }
         }
 
         const senderName = msg.pushName || jid.split('@')[0];
 
-        await sock.sendPresenceUpdate('composing', jid);
-        const delayMs = randomBetween(DELAY_MIN_MS, DELAY_MAX_MS);
-        await sleep(delayMs);
-
-        const reply = await generateCloneReply(jid, senderName, text);
-        await sock.sendPresenceUpdate('paused', jid);
+        let reply = '';
+        try {
+          await sock.sendPresenceUpdate('composing', jid);
+          const delayMs = randomBetween(DELAY_MIN_MS, DELAY_MAX_MS);
+          await sleep(delayMs);
+          reply = await generateCloneReply(jid, senderName, text);
+        } finally {
+          await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+        }
 
         if (reply) {
-          await sock.sendMessage(jid, { text: reply });
+          const bubbles = reply
+            .split(/\n+/)
+            .map((line) => line.trim())
+            .filter(Boolean);
+
+          for (let i = 0; i < bubbles.length; i += 1) {
+            if (i > 0) {
+              await sock.sendPresenceUpdate('composing', jid).catch(() => {});
+              await sleep(randomBetween(600, 1200));
+              await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+            }
+            await sock.sendMessage(jid, { text: bubbles[i] });
+          }
+
+          appendChatLog({
+            time: new Date().toISOString(),
+            jid,
+            sender: senderName,
+            incoming: text,
+            reply,
+          });
+          console.log(`[WA] ${senderName}: "${text}" -> "${reply.replace(/\n/g, ' | ')}"`);
+        } else {
+          appendChatLog({
+            time: new Date().toISOString(),
+            jid,
+            sender: senderName,
+            incoming: text,
+            reply: '[READ_ONLY]',
+          });
+          console.log(`[WA] ${senderName}: "${text}" -> [READ_ONLY]`);
         }
       } catch (err) {
         console.error('[Bot] Gagal memproses pesan:', err.message);

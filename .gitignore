@@ -1,4 +1,10 @@
 node_modules/
 .env
 auth_info/
+data/persona.txt
+data/facts.txt
+data/examples.json
+data/*.jsonl
+data/*.log
+WhatsApp Chat*.txt
 *.log

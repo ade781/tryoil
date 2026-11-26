@@ -9,7 +9,7 @@ const DATA_DIR = path.join(ROOT_DIR, 'data');
 const EXAMPLES_PATH = path.join(DATA_DIR, 'examples.json');
 const PERSONA_PATH = path.join(DATA_DIR, 'persona.txt');
 
-const MAX_EXAMPLES = 300;
+const MAX_EXAMPLES = 3000;
 
 // Karakter tak terlihat yang sering disisipkan WhatsApp (LTR/RTL mark, BOM, dll.)
 const INVISIBLE_CHARS_RE = /[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
@@ -173,6 +173,10 @@ function parseWhatsAppExport(content) {
   const messages = [];
 
   for (const msg of rawMessages) {
+    if (msg.date === '11/25/26' || msg.date === '11/25/2026' || msg.text.includes('\u200b')) {
+      filteredOutCount++;
+      continue;
+    }
     const cleaned = cleanMessageText(msg.text);
     if (isIgnoredBody(cleaned)) {
       filteredOutCount++;
@@ -276,6 +280,7 @@ function analyzeOwnerStyle(ownerMessages) {
 
   const particleCounts = Object.create(null);
   const wordCounts = Object.create(null);
+  const bigramCounts = Object.create(null);
   const emojiRe = /[\p{Extended_Pictographic}]/u;
   const laughRe = /\b(?:wkwk+|wk+|haha+|hehe+|hihi+)\b/i;
 
@@ -310,12 +315,20 @@ function analyzeOwnerStyle(ownerMessages) {
       .split(/\s+/)
       .filter(Boolean);
 
-    for (const tok of tokens) {
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i];
       if (TRACKED_PARTICLES.includes(tok)) {
         particleCounts[tok] = (particleCounts[tok] || 0) + 1;
       }
       if (tok.length >= 2 && !/^https?$/.test(tok)) {
         wordCounts[tok] = (wordCounts[tok] || 0) + 1;
+      }
+      if (i < tokens.length - 1) {
+        const next = tokens[i + 1];
+        if (tok.length >= 2 && next.length >= 2 && !/^https?$/.test(tok) && !/^https?$/.test(next)) {
+          const bg = `${tok} ${next}`;
+          bigramCounts[bg] = (bigramCounts[bg] || 0) + 1;
+        }
       }
     }
   }
@@ -324,31 +337,39 @@ function analyzeOwnerStyle(ownerMessages) {
 
   const topParticles = Object.entries(particleCounts)
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 12);
+    .slice(0, 15);
 
   const topWords = Object.entries(wordCounts)
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 12);
+    .slice(0, 20);
 
-  // Pilih frasa representatif yang bersih & bervariasi
-  const sampleCandidates = ownerMessages.filter(
-    (t) =>
-      t.length >= 12 &&
-      t.length <= 110 &&
-      !/https?:\/\//i.test(t) &&
-      !t.includes('\n')
+  const topBigrams = Object.entries(bigramCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 15);
+
+  // Pilih frasa representatif per kategori situasi
+  const cleanSingles = ownerMessages.filter(
+    (t) => t.length >= 6 && t.length <= 120 && !/https?:\/\//i.test(t) && !t.includes('\n')
   );
-  const uniqueSamples = [];
-  const sampleSeen = new Set();
-  const step = Math.max(1, Math.floor(sampleCandidates.length / 15));
-  for (let i = 0; i < sampleCandidates.length && uniqueSamples.length < 12; i += step) {
-    const s = sampleCandidates[i].trim();
-    const key = s.toLowerCase();
-    if (!sampleSeen.has(key)) {
-      sampleSeen.add(key);
-      uniqueSamples.push(s);
+  const pickByFilter = (fn, max = 6) => {
+    const matched = cleanSingles.filter(fn);
+    const out = [];
+    const seen = new Set();
+    const step = Math.max(1, Math.floor(matched.length / (max * 2)));
+    for (let i = 0; i < matched.length && out.length < max; i += step) {
+      const s = matched[i].trim();
+      const k = s.toLowerCase();
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(s);
+      }
     }
-  }
+    return out;
+  };
+
+  const sampleQuestions = pickByFilter((t) => t.includes('?'), 6);
+  const sampleLaughs = pickByFilter((t) => laughRe.test(t), 6);
+  const sampleGeneral = pickByFilter((t) => t.length >= 15 && !t.includes('?'), 8);
 
   return {
     total,
@@ -365,7 +386,10 @@ function analyzeOwnerStyle(ownerMessages) {
     hasEmojiPct: pct(hasEmoji),
     topParticles,
     topWords,
-    samples: uniqueSamples,
+    topBigrams,
+    sampleQuestions,
+    sampleLaughs,
+    samples: sampleGeneral,
   };
 }
 
@@ -399,35 +423,54 @@ function buildPersonaText(ownerName, stats) {
       ? stats.topWords.map(([w, c]) => `${w} (${c}x)`).join(', ')
       : '-';
 
+  const topBigramList =
+    stats.topBigrams && stats.topBigrams.length > 0
+      ? stats.topBigrams.map(([w, c]) => `"${w}" (${c}x)`).join(', ')
+      : '-';
+
   const sampleLines =
     stats.samples.length > 0
       ? stats.samples.map((s) => `- "${s}"`).join('\n')
       : '- (Belum ada sampel representatif)';
 
+  const questionLines =
+    stats.sampleQuestions && stats.sampleQuestions.length > 0
+      ? stats.sampleQuestions.map((s) => `- "${s}"`).join('\n')
+      : '- (Belum ada sampel)';
+
+  const laughLines =
+    stats.sampleLaughs && stats.sampleLaughs.length > 0
+      ? stats.sampleLaughs.map((s) => `- "${s}"`).join('\n')
+      : '- (Belum ada sampel)';
+
   return `# Persona WhatsApp Clone: ${ownerName}
-# Dihasilkan otomatis oleh scripts/import-chat.js dari ${stats.total} pesan.
-# Kamu bebas mengedit file ini agar gaya balasannya makin pas.
+# Dihasilkan otomatis oleh scripts/import-chat.js dari ${stats.total} pesan organik murni.
 
 Kamu membalas chat WhatsApp sebagai **${ownerName}**.
-Balas pesan dengan gaya bahasa Indonesia kasual yang natural, manusiawi, dan meniru kebiasaan mengetik berikut (JANGAN terdengar seperti AI/robot atau customer service formal):
+Balas pesan dengan gaya bahasa Indonesia + Jawa Ngoko Bantul/Jogja kasual yang natural, manusiawi, dan meniru kebiasaan mengetik berikut:
 
-## Ringkasan Gaya Ketik
-- Panjang pesan: ${lengthRule}
-- Kapitalisasi: ${caseRule}
-- Tanda baca: ${periodRule} Tanya (${stats.hasQuestionPct}%), seru (${stats.hasExclamationPct}%), elipsis "..." (${stats.hasEllipsisPct}%).
-- Ekspresi: Tawa seperti wkwk/haha (${stats.hasLaughPct}% pesan), emoji (${stats.hasEmojiPct}% pesan).
+## Ringkasan Gaya Ketik & Ritme
+- Panjang pesan: ${lengthRule} Utamakan 1 baris singkat (2–7 kata); jangan memaksakan format 2 baris terus-menerus.
+- Kapitalisasi: ${caseRule} Kata ulang ditulis spasi biasa tanpa tanda hubung ("alon alon", "konco konco", bukan "alon-alon").
+- Tanda baca: ${periodRule} Tanya (${stats.hasQuestionPct}%), seru (${stats.hasExclamationPct}%).
+- Frekuensi tawa SANGAT JARANG: Lebih dari 96% pesan TANPA tawa! wkwk/hehe hanya sekitar ${stats.hasLaughPct}% pesan. DILARANG menaruh "wkwk" di ujung kalimat biasa atau saat menjelaskan hal teknis/serius.
+- Frekuensi sapaan "sa": Hanya muncul di ~12% pesan (~1 dari 4–5 giliran). JANGAN menyebut "sa" terus-menerus di setiap balasan beruntun.
 
-## Kosakata & Partikel Khas
-- Kata/partikel khas yang sering dipakai: ${particleList}
+## Kosakata, Partikel & Aturan Dialek Murni Bantul/Jogja
+- Wajib pakai kosakata asli ${ownerName}: "ono/raono" (BUKAN enek/ana), "wae" (BUKAN ae), "sik" untuk arti yang/dulu (BUKAN sek/sing/yg), "ning" untuk di/ke (BUKAN neng/ng, kecuali kata tanya "nengdi/nangdi"), "pie" (BUKAN piye/gimana), "nik/nek" (BUKAN kalau/kalo), "ra/ora" (BUKAN gak/nggak), "udu" (BUKAN bukan/dudu), "ro/karo" (BUKAN sama), "kek e / ketoke" (BUKAN koyoke), "ra reti / ra ngerti" (BUKAN drng reti blas).
+- Catatan arti Jawa: kata "mau" di chat ${ownerName} mayoritas berarti "tadi" ("mau esuk" = tadi pagi), sedangkan "ingin" = "meh" atau "pengen".
 - Kata paling sering muncul: ${topWordList}
+- Frasa 2-kata khas (bigram): ${topBigramList}
 
-## Aturan Tambahan
-- Jangan pakai bahasa baku atau salam pembuka/penutup ala bot ("Halo! Ada yang bisa saya bantu?").
-- Jawab langsung ke inti obrolan sesuai konteks pesan terakhir.
-- Jika tidak tahu sesuatu yang spesifik (misal jadwal mendadak/info pribadi baru), jawab singkat secara natural seperti pemilik akun aslinya.
+## Gaya Saat Membantu Teknis / Menjelaskan Sesuatu
+- Taktis, langsung 1 langkah singkat per balasan atau tanya balik singkat ("Pojok kiri bawah iku", "Klik kanan terus disable sik", "Iso ga?").
+- DILARANG memborong 3 solusi sekaligus dan DILARANG mengulang kalimat alasan teknis "Biasane kadang error..." ala customer service. Tanpa wkwk tempelan!
 
-## Contoh Gaya Kalimat Asli
+## Contoh Gaya Kalimat Asli (Umum)
 ${sampleLines}
+
+## Contoh Gaya Saat Bertanya Balik
+${questionLines}
 `;
 }
 
