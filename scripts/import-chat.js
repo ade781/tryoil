@@ -8,6 +8,7 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const DATA_DIR = path.join(ROOT_DIR, 'data');
 const EXAMPLES_PATH = path.join(DATA_DIR, 'examples.json');
 const PERSONA_PATH = path.join(DATA_DIR, 'persona.txt');
+const ARCHIVE_PATH = path.join(DATA_DIR, 'chat-archive.jsonl');
 
 const MAX_EXAMPLES = 3000;
 
@@ -183,6 +184,8 @@ function parseWhatsAppExport(content) {
       continue;
     }
     messages.push({
+      date: msg.date,
+      time: msg.time,
       sender: msg.sender,
       text: cleaned,
     });
@@ -481,13 +484,16 @@ function main() {
     process.exit(args.length === 0 ? 1 : 0);
   }
 
-  const chatFilePath = path.resolve(process.cwd(), args[0]);
-  if (!fs.existsSync(chatFilePath)) {
+  const archiveOnly = args.includes('--archive-only');
+  const positionalArgs = args.filter((a) => !a.startsWith('--'));
+
+  const chatFilePath = path.resolve(process.cwd(), positionalArgs[0] || '');
+  if (!positionalArgs[0] || !fs.existsSync(chatFilePath)) {
     console.error(`[ERROR] File chat tidak ditemukan: ${chatFilePath}`);
     process.exit(1);
   }
 
-  const ownerName = (args[1] || loadEnvOwnerName()).trim();
+  const ownerName = (positionalArgs[1] || loadEnvOwnerName()).trim();
   if (!ownerName) {
     console.error(
       '[ERROR] Nama WhatsApp pemilik tidak ditemukan.\n' +
@@ -514,12 +520,31 @@ function main() {
     process.exit(1);
   }
 
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const archiveLines = parsed.messages.map((m, idx) =>
+    JSON.stringify({
+      id: idx + 1,
+      date: m.date,
+      time: m.time,
+      sender: m.sender,
+      isOwner: m.sender.toLowerCase() === ownerLower,
+      text: m.text,
+    })
+  );
+  fs.writeFileSync(ARCHIVE_PATH, archiveLines.join('\n') + '\n', 'utf8');
+
+  if (archiveOnly) {
+    console.log(`=== Arsip Chat Diperbarui (--archive-only) ===`);
+    console.log(`File sumber : ${chatFilePath}`);
+    console.log(`Total pesan : ${parsed.messages.length} (disimpan ke ${ARCHIVE_PATH})`);
+    return;
+  }
+
   const turns = mergeConsecutiveTurns(parsed.messages, ownerLower);
   const qaPairs = buildQaPairs(turns);
   const stats = analyzeOwnerStyle(ownerMessages);
   const personaText = buildPersonaText(ownerName, stats);
 
-  fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(EXAMPLES_PATH, JSON.stringify(qaPairs, null, 2) + '\n', 'utf8');
   fs.writeFileSync(PERSONA_PATH, personaText, 'utf8');
 
@@ -532,6 +557,7 @@ function main() {
   console.log(`Pesan valid total  : ${parsed.messages.length}`);
   console.log(`Pesan dari kamu    : ${ownerMessages.length}`);
   console.log(`Pasangan Q&A       : ${qaPairs.length} (disimpan ke data/examples.json)`);
+  console.log(`Arsip chat         : ${ARCHIVE_PATH}`);
   console.log(`Gaya ketik         : rata-rata ${stats.avgChars} karakter, ${stats.allLowerPct}% huruf kecil semua`);
   console.log(`Persona diperbarui : ${PERSONA_PATH}`);
 }

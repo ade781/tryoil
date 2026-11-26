@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const dns = require('dns');
+const { queryBM25Examples, scoreAdeStyle } = require('./style-trainer');
 
 dns.setDefaultResultOrder('ipv4first');
 
@@ -340,9 +341,8 @@ async function generateCloneReply(jid, senderName, userMessage) {
 
   const persona = loadPersona();
   const facts = loadFacts();
-  const examples = loadExamples();
   const exampleQuery = recentContext ? `${userMessage}\n${recentContext}` : userMessage;
-  const topExamples = pickRelevantExamples(exampleQuery, examples, TOP_EXAMPLES_COUNT);
+  const topExamples = queryBM25Examples(exampleQuery, TOP_EXAMPLES_COUNT);
 
   const examplesBlock = topExamples.length
     ? `\n\nContoh asli cara ${ownerName} mengetik (tiru ritme pendek, campuran Indo + Ngoko Bantul, dan ke-to-the-point-annya):\n` +
@@ -490,12 +490,89 @@ async function generateCloneReply(jid, senderName, userMessage) {
     throw lastError || new Error('Semua model Gemini gagal merespons.');
   }
 
+  const stylePct = Math.round(scoreAdeStyle(replyText) * 100);
+  console.log(`[AI] Style score (${safeSender || 'user'}): ${stylePct}%`);
   appendHistory(jid, formattedUserText, replyText);
   return replyText;
 }
 
+/**
+ * Generate a natural proactive "Dor!" opener when a target chat has been quiet.
+ * @param {string} jid
+ * @param {string} senderName
+ * @param {number} attemptNumber
+ * @returns {Promise<string>}
+ */
+async function generateProactiveOpener(jid, senderName, attemptNumber = 1) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === 'isi_api_key_gemini_disini') {
+    throw new Error('GEMINI_API_KEY belum dikonfigurasi di .env');
+  }
+
+  const candidateModels = getCandidateModels();
+  const ownerName = process.env.OWNER_NAME || 'Ade';
+  const allowSa = isSasaSender(senderName);
+  const history = getHistory(jid).slice(-6);
+  const recentSnippet = history
+    .map((h) => h.parts?.[0]?.text || '')
+    .filter(Boolean)
+    .join('\n');
+
+  const nowWib = new Intl.DateTimeFormat('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    weekday: 'long',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date());
+
+  const promptText = [
+    `Kamu adalah ${ownerName}. Sekarang ${nowWib} WIB.`,
+    `Sudah beberapa hari tidak ada chat dengan ${senderName || 'temanmu'}.`,
+    `Ini sapaan proaktif ke-${attemptNumber} (maksimal 3).`,
+    recentSnippet ? `Potongan chat terakhir:\n${recentSnippet}` : '',
+    allowSa
+      ? `Buat 1–2 bubble sapaan pembuka yang SANGAT natural khas Ade ke Sasa (misal variasi "Dor", "Sa", "Sibuk po sa", atau menanyakan kabar/kelanjutan obrolan terakhir secara santai tanpa terkesan robot/kaku).`
+      : `Buat 1 bubble sapaan singkat santai khas ${ownerName}.`,
+    `Hanya keluarkan teks chat biasa tanpa markdown/tag.`,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  for (const model of candidateModels) {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      model
+    )}:generateContent`;
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-goog-api-key': apiKey },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: promptText }] }],
+          generationConfig: { temperature: 0.85, maxOutputTokens: 200 },
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) continue;
+      const data = await response.json();
+      const raw = (data?.candidates?.[0]?.content?.parts || [])
+        .filter((p) => p && typeof p.text === 'string' && !p.thought)
+        .map((p) => p.text)
+        .join('');
+      const cleaned = sanitizeModelOutput(raw, allowSa);
+      if (cleaned) {
+        appendHistory(jid, '[PROACTIVE_TRIGGER]', cleaned);
+        return cleaned;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return allowSa ? 'Dor\nSibuk po sa' : 'Halo, aman?';
+}
+
 module.exports = {
   generateCloneReply,
+  generateProactiveOpener,
   pickRelevantExamples,
   hydrateHistoryFromLog,
   sanitizeModelOutput,

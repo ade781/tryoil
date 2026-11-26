@@ -11,7 +11,17 @@ const {
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
-const { generateCloneReply, hydrateHistoryFromLog } = require('./ai');
+const { generateCloneReply, generateProactiveOpener, hydrateHistoryFromLog } = require('./ai');
+const { startIdleTrainer, notifyChatActivity, getTrainerStats } = require('./style-trainer');
+const { loadArchiveMessages, appendLiveToSearchCache, searchChatArchive, getArchiveStats } = require('./archive-search');
+const { downloadVideo, downloadMp3, createStickerFromMessage } = require('./media-tools');
+const {
+  startProactiveScheduler,
+  recordIncomingActivity,
+  recordOutgoingActivity,
+  setProactiveEnabled,
+  getProactiveStatus,
+} = require('./proactive');
 
 const AUTH_DIR = path.join(__dirname, '..', 'auth_info');
 const CHAT_LOG_PATH = path.join(__dirname, '..', 'data', 'chat-log.jsonl');
@@ -21,6 +31,7 @@ const IGNORE_GROUPS = process.env.IGNORE_GROUPS !== 'false';
 const BUBBLE_DEBOUNCE_MS = 4000;
 const pendingBatches = new Map();
 const jidQueues = new Map();
+let activeSocket = null;
 function normalizePhone(raw) {
   const digits = String(raw || '').split('@')[0].replace(/\D/g, '');
   if (digits.startsWith('08')) {
@@ -81,15 +92,51 @@ function extractMessageText(msg) {
   ).trim();
 }
 
+function extractQuotedMediaMessage(msg) {
+  const ctx = msg?.message?.extendedTextMessage?.contextInfo;
+  if (!ctx?.quotedMessage) return null;
+  if (!ctx.quotedMessage.imageMessage && !ctx.quotedMessage.videoMessage) return null;
+  return {
+    key: {
+      remoteJid: msg.key.remoteJid,
+      id: ctx.stanzaId,
+      participant: ctx.participant,
+    },
+    message: ctx.quotedMessage,
+  };
+}
+
+function resolveStickerTarget(msg) {
+  if (msg?.message?.imageMessage || msg?.message?.videoMessage) {
+    return msg;
+  }
+  return extractQuotedMediaMessage(msg);
+}
+
+async function handleStickerCommand(sock, jid, msg) {
+  const targetMsg = resolveStickerTarget(msg);
+  if (!targetMsg) {
+    await sock.sendMessage(jid, {
+      text: 'Kirim gambar/video dengan caption !s atau reply gambar/video dengan !s.',
+    });
+    return;
+  }
+  const webpBuffer = await createStickerFromMessage(targetMsg, sock);
+  await sock.sendMessage(jid, { sticker: webpBuffer }, { quoted: msg });
+}
+
 /**
- * Handle owner self-commands (!clone on/off/status).
+ * Handle owner self-commands (!clone, !cari, !dl, !mp3, !s, !dor).
  * @param {object} sock
  * @param {string} jid
  * @param {string} text
+ * @param {object} msg
  * @returns {Promise<boolean>} true if command was handled
  */
-async function handleOwnerCommand(sock, jid, text) {
-  const cmd = text.replace(/\s+/g, ' ').trim().toLowerCase();
+async function handleOwnerCommand(sock, jid, text, msg) {
+  const cleanText = text.replace(/\s+/g, ' ').trim();
+  const cmd = cleanText.toLowerCase();
+
   if (cmd === '!clone off') {
     cloneEnabled = false;
     await sock.sendMessage(jid, { text: '🔴 WA Clone dimatikan.' });
@@ -100,6 +147,19 @@ async function handleOwnerCommand(sock, jid, text) {
     await sock.sendMessage(jid, { text: '🟢 WA Clone diaktifkan.' });
     return true;
   }
+  if (cmd === '!clone help') {
+    const helpText = [
+      `🤖 *Daftar Perintah WA Clone*`,
+      `• !clone on / off / status`,
+      `• !cari <kata kunci> — cari riwayat chat`,
+      `• !s / !stiker — ubah gambar/video jadi stiker`,
+      `• !dl <url> — download video (TikTok/IG/YT)`,
+      `• !mp3 <url> — download audio MP3`,
+      `• !dor on / off / status / test — auto sapaan saat sepi`,
+    ].join('\n');
+    await sock.sendMessage(jid, { text: helpText });
+    return true;
+  }
   if (cmd === '!clone status') {
     const ownerNumber = normalizePhone(sock.user?.id || '');
     const targetNumber = normalizePhone(jid);
@@ -108,15 +168,105 @@ async function handleOwnerCommand(sock, jid, text) {
       return true;
     }
     const allowedInfo = ALLOWED_NUMBERS.length ? ALLOWED_NUMBERS.join(', ') : 'Semua private chat';
+    const tr = getTrainerStats();
+    const ar = getArchiveStats();
+    const pr = getProactiveStatus();
     const statusText = [
       `🤖 *WA Clone Status*`,
       `• Aktif: ${cloneEnabled ? 'ON 🟢' : 'OFF 🔴'}`,
       `• Ignore Grup: ${IGNORE_GROUPS ? 'Ya' : 'Tidak'}`,
       `• Allowed: ${allowedInfo}`,
+      `• Idle Trainer: ${tr.enabled ? (tr.pausedByChat ? 'Paused (Chat)' : 'Running') : 'OFF'} | Epoch ${tr.epochs} | Acc ${tr.accuracyPct}% | BM25 ${tr.bm25Docs} | RSS ${tr.rssMb}MB`,
+      `• Arsip Chat: ${ar.totalMessages} pesan terindeks`,
+      `• Proactive Dor: ${pr.enabled ? 'ON' : 'OFF'} (${pr.priorityWib} prio, ${pr.windowWib} max)`,
     ].join('\n');
     await sock.sendMessage(jid, { text: statusText });
     return true;
   }
+
+  if (cmd.startsWith('!cari ')) {
+    const query = cleanText.slice(6).trim();
+    const hits = searchChatArchive(query, 5);
+    if (!hits.length) {
+      await sock.sendMessage(jid, { text: `Tidak ditemukan hasil untuk "${query}".` });
+      return true;
+    }
+    const formatted = hits
+      .map((h, i) => {
+        const prevLine = h.contextPrev ? `\n  ↳ sebelumnya: ${h.contextPrev.slice(0, 80)}` : '';
+        return `${i + 1}. [${h.date} ${h.time}] ${h.sender}: ${h.text}${prevLine}`;
+      })
+      .join('\n\n');
+    await sock.sendMessage(jid, { text: `🔎 *Hasil "${query}":*\n\n${formatted}` });
+    return true;
+  }
+
+  if (cmd === '!s' || cmd === '!stiker') {
+    try {
+      await handleStickerCommand(sock, jid, msg);
+    } catch (err) {
+      await sock.sendMessage(jid, { text: `❌ Gagal buat stiker: ${err.message}` });
+    }
+    return true;
+  }
+
+  if (cmd.startsWith('!dl ')) {
+    const url = cleanText.slice(4).trim();
+    await sock.sendMessage(jid, { text: '⏳ Mengunduh video...' });
+    try {
+      const { buffer } = await downloadVideo(url);
+      await sock.sendMessage(jid, { video: buffer, caption: '✅ Selesai' });
+    } catch (err) {
+      await sock.sendMessage(jid, { text: `❌ Gagal download video: ${err.message}` });
+    }
+    return true;
+  }
+
+  if (cmd.startsWith('!mp3 ')) {
+    const url = cleanText.slice(5).trim();
+    await sock.sendMessage(jid, { text: '⏳ Mengunduh & convert MP3...' });
+    try {
+      const { buffer } = await downloadMp3(url);
+      await sock.sendMessage(jid, { audio: buffer, mimetype: 'audio/mpeg' });
+    } catch (err) {
+      await sock.sendMessage(jid, { text: `❌ Gagal download MP3: ${err.message}` });
+    }
+    return true;
+  }
+
+  if (cmd === '!dor on') {
+    setProactiveEnabled(true);
+    await sock.sendMessage(jid, { text: '🟢 Proactive Dor diaktifkan.' });
+    return true;
+  }
+  if (cmd === '!dor off') {
+    setProactiveEnabled(false);
+    await sock.sendMessage(jid, { text: '🔴 Proactive Dor dimatikan.' });
+    return true;
+  }
+  if (cmd === '!dor status') {
+    const st = getProactiveStatus();
+    const lines = st.targets.map(
+      (t) =>
+        `• ${t.senderName}: sepi ${t.idleHours}j / target ${t.targetHours}j (sapaan ${t.followupCount}/${t.maxFollowups})`
+    );
+    await sock.sendMessage(jid, {
+      text: `🔔 *Proactive Dor (${st.enabled ? 'ON' : 'OFF'})*\nWindow: ${st.windowWib} (Prio ${st.priorityWib})\n${lines.join('\n') || '-'}`,
+    });
+    return true;
+  }
+  if (cmd === '!dor test') {
+    const st = getProactiveStatus();
+    const first = st.targets[0];
+    const sample = await generateProactiveOpener(
+      first?.jid || 'test-dor',
+      first?.senderName || 'Sasa',
+      1
+    );
+    await sock.sendMessage(jid, { text: `🧪 *Simulasi Sapaan Dor:*\n${sample}` });
+    return true;
+  }
+
   return false;
 }
 
@@ -153,6 +303,8 @@ async function processCombinedMessage(sock, jid, senderName, combinedText) {
       incoming: combinedText,
       reply,
     });
+    appendLiveToSearchCache(senderName, combinedText, reply);
+    recordOutgoingActivity(jid);
     console.log(`[WA] ${senderName}: "${combinedText.replace(/\n/g, ' | ')}" -> "${reply.replace(/\n/g, ' | ')}"`);
   }
 }
@@ -183,6 +335,14 @@ function enqueueIncomingBubble(sock, jid, senderName, text) {
 
 async function startBot() {
   hydrateHistoryFromLog(CHAT_LOG_PATH);
+  loadArchiveMessages();
+  startIdleTrainer();
+  startProactiveScheduler({
+    getSocket: () => activeSocket,
+    generateProactiveOpener,
+    appendChatLog,
+  });
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -191,6 +351,7 @@ async function startBot() {
     auth: state,
     logger: pino({ level: 'silent' }),
   });
+  activeSocket = sock;
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -230,7 +391,9 @@ async function startBot() {
         if (!text) continue;
 
         if (msg.key.fromMe) {
-          await handleOwnerCommand(sock, jid, text);
+          notifyChatActivity();
+          recordOutgoingActivity(jid);
+          await handleOwnerCommand(sock, jid, text, msg);
           continue;
         }
 
@@ -267,6 +430,19 @@ async function startBot() {
         }
 
         const senderName = msg.pushName || jid.split('@')[0];
+        notifyChatActivity();
+        recordIncomingActivity(jid, senderName);
+
+        const lowerCmd = text.replace(/\s+/g, ' ').trim().toLowerCase();
+        if (lowerCmd === '!s' || lowerCmd === '!stiker') {
+          try {
+            await handleStickerCommand(sock, jid, msg);
+          } catch (err) {
+            await sock.sendMessage(jid, { text: `Gagal buat stiker: ${err.message}` });
+          }
+          continue;
+        }
+
         enqueueIncomingBubble(sock, jid, senderName, text);
       } catch (err) {
         console.error('[Bot] Gagal memproses pesan:', err.message);
