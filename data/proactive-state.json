@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "targets": {
+    "100721496207449@lid": {
+      "senderName": "Sasa",
+      "lastIncomingAt": 1795697487814,
+      "lastOutgoingAt": 1795697487814,
+      "lastProactiveAt": 0,
+      "followupCount": 0,
+      "nextThresholdMs": 333801465
+    }
+  }
+}
