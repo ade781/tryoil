@@ -11,13 +11,16 @@ const {
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
-const { generateCloneReply } = require('./ai');
+const { generateCloneReply, hydrateHistoryFromLog } = require('./ai');
 
 const AUTH_DIR = path.join(__dirname, '..', 'auth_info');
 const CHAT_LOG_PATH = path.join(__dirname, '..', 'data', 'chat-log.jsonl');
 const DELAY_MIN_MS = Math.max(0, Number(process.env.REPLY_DELAY_MIN_MS) || 1500);
 const DELAY_MAX_MS = Math.max(DELAY_MIN_MS, Number(process.env.REPLY_DELAY_MAX_MS) || 3500);
 const IGNORE_GROUPS = process.env.IGNORE_GROUPS !== 'false';
+const BUBBLE_DEBOUNCE_MS = 4000;
+const pendingBatches = new Map();
+const jidQueues = new Map();
 function normalizePhone(raw) {
   const digits = String(raw || '').split('@')[0].replace(/\D/g, '');
   if (digits.startsWith('08')) {
@@ -117,7 +120,69 @@ async function handleOwnerCommand(sock, jid, text) {
   return false;
 }
 
+async function processCombinedMessage(sock, jid, senderName, combinedText) {
+  let reply = '';
+  try {
+    await sock.sendPresenceUpdate('composing', jid);
+    const delayMs = randomBetween(DELAY_MIN_MS, DELAY_MAX_MS);
+    await sleep(delayMs);
+    reply = await generateCloneReply(jid, senderName, combinedText);
+  } finally {
+    await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+  }
+
+  if (reply) {
+    const bubbles = reply
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    for (let i = 0; i < bubbles.length; i += 1) {
+      if (i > 0) {
+        await sock.sendPresenceUpdate('composing', jid).catch(() => {});
+        await sleep(randomBetween(600, 1200));
+        await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+      }
+      await sock.sendMessage(jid, { text: bubbles[i] });
+    }
+
+    appendChatLog({
+      time: new Date().toISOString(),
+      jid,
+      sender: senderName,
+      incoming: combinedText,
+      reply,
+    });
+    console.log(`[WA] ${senderName}: "${combinedText.replace(/\n/g, ' | ')}" -> "${reply.replace(/\n/g, ' | ')}"`);
+  }
+}
+
+function enqueueIncomingBubble(sock, jid, senderName, text) {
+  const existing = pendingBatches.get(jid);
+  if (existing) {
+    clearTimeout(existing.timer);
+    existing.texts.push(text);
+    existing.senderName = senderName;
+  } else {
+    pendingBatches.set(jid, { senderName, texts: [text], timer: null });
+  }
+
+  const batch = pendingBatches.get(jid);
+  batch.timer = setTimeout(() => {
+    pendingBatches.delete(jid);
+    const combinedText = batch.texts.join('\n');
+    const prevQueue = jidQueues.get(jid) || Promise.resolve();
+    const nextQueue = prevQueue
+      .then(() => processCombinedMessage(sock, jid, batch.senderName, combinedText))
+      .catch((err) => {
+        console.error('[Bot] Gagal memproses pesan:', err.message);
+      });
+    jidQueues.set(jid, nextQueue);
+  }, BUBBLE_DEBOUNCE_MS);
+}
+
 async function startBot() {
+  hydrateHistoryFromLog(CHAT_LOG_PATH);
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -202,50 +267,7 @@ async function startBot() {
         }
 
         const senderName = msg.pushName || jid.split('@')[0];
-
-        let reply = '';
-        try {
-          await sock.sendPresenceUpdate('composing', jid);
-          const delayMs = randomBetween(DELAY_MIN_MS, DELAY_MAX_MS);
-          await sleep(delayMs);
-          reply = await generateCloneReply(jid, senderName, text);
-        } finally {
-          await sock.sendPresenceUpdate('paused', jid).catch(() => {});
-        }
-
-        if (reply) {
-          const bubbles = reply
-            .split(/\n+/)
-            .map((line) => line.trim())
-            .filter(Boolean);
-
-          for (let i = 0; i < bubbles.length; i += 1) {
-            if (i > 0) {
-              await sock.sendPresenceUpdate('composing', jid).catch(() => {});
-              await sleep(randomBetween(600, 1200));
-              await sock.sendPresenceUpdate('paused', jid).catch(() => {});
-            }
-            await sock.sendMessage(jid, { text: bubbles[i] });
-          }
-
-          appendChatLog({
-            time: new Date().toISOString(),
-            jid,
-            sender: senderName,
-            incoming: text,
-            reply,
-          });
-          console.log(`[WA] ${senderName}: "${text}" -> "${reply.replace(/\n/g, ' | ')}"`);
-        } else {
-          appendChatLog({
-            time: new Date().toISOString(),
-            jid,
-            sender: senderName,
-            incoming: text,
-            reply: '[READ_ONLY]',
-          });
-          console.log(`[WA] ${senderName}: "${text}" -> [READ_ONLY]`);
-        }
+        enqueueIncomingBubble(sock, jid, senderName, text);
       } catch (err) {
         console.error('[Bot] Gagal memproses pesan:', err.message);
       }
