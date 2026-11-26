@@ -41,12 +41,14 @@ let trainerState = {
 let dataset = [];
 let datasetCursor = 0;
 let lastSaveAt = Date.now();
+let hasUnsavedProgress = false;
 
 /**
  * Notify the idle trainer that chat activity occurred so it pauses immediately.
  */
 function notifyChatActivity() {
   lastChatActivityAt = Date.now();
+  hasUnsavedProgress = true;
 }
 
 function tokenizeWords(text) {
@@ -334,6 +336,7 @@ function saveModel() {
     };
     fs.writeFileSync(MODEL_PATH, JSON.stringify(payload), 'utf8');
     lastSaveAt = Date.now();
+    hasUnsavedProgress = false;
   } catch (err) {
     console.warn('[Trainer] Failed to save style-model.json:', err.message);
   }
@@ -387,9 +390,12 @@ function runIdleTick() {
     if (!isBusy && rss < MAX_RSS_BYTES) {
       while (Date.now() - start < DUTY_COMPUTE_MS) {
         trainBatch(BATCH_SIZE);
+        if (trainerState.epochs <= 5) {
+          hasUnsavedProgress = true;
+        }
         if (Date.now() - lastChatActivityAt < IDLE_PAUSE_MS) break;
       }
-      if (Date.now() - lastSaveAt >= SAVE_INTERVAL_MS) {
+      if (hasUnsavedProgress && Date.now() - lastSaveAt >= SAVE_INTERVAL_MS) {
         saveModel();
       }
     }
